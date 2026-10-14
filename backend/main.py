@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
 import io
-import json
 
 from app.profiler import profile_dataset
 from app.preprocessor import Preprocessor
@@ -40,11 +39,20 @@ def to_json_safe(obj):
     return obj
 
 
+def read_csv_safely(contents: bytes) -> pd.DataFrame:
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(io.BytesIO(contents), encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("Could not decode the CSV. Please save it as UTF-8 and try again.")
+
+
 @app.post("/upload")
 async def upload_dataset(file: UploadFile = File(...), max_rows: int = Form(5000)):
     try:
         contents = await file.read()
-        df = pd.read_csv(io.BytesIO(contents))
+        df = read_csv_safely(contents)
 
         if len(df) > max_rows:
             df = df.sample(max_rows, random_state=42).reset_index(drop=True)
@@ -64,7 +72,67 @@ async def upload_dataset(file: UploadFile = File(...), max_rows: int = Form(5000
         return {"dataset_id": dataset_id, "profile": profile_safe, "row_count": len(df)}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {type(e).__name__}: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Upload failed: {type(e).__name__}: {str(e)}")
+
+
+def run_generation_job(job_id: str, dataset_id: str, target_col: str, epsilon: float, n_rows: int):
+    supabase.table("jobs").update({"status": "running"}).eq("id", job_id).execute()
+
+    try:
+        dataset_row = supabase.table("datasets").select("data").eq("id", dataset_id).single().execute()
+        df = pd.DataFrame(dataset_row.data["data"])
+
+        profile = profile_dataset(df)
+        prep = Preprocessor(profile)
+        data = prep.fit_transform(df)
+
+        usable_cols = prep.numeric_cols + prep.categorical_cols
+        if not usable_cols:
+            raise ValueError("No usable numeric/categorical columns found to synthesize.")
+
+        model, achieved_epsilon = train_vae(
+            data, prep.numeric_dim, prep.categorical_slices,
+            latent_dim=8, epochs=300, use_dp=True, target_epsilon=epsilon, beta=0.5
+        )
+
+        rows = n_rows or len(df)
+        synthetic_raw = model._module.sample(rows, latent_dim=8).numpy()
+        synthetic_raw = prep.to_valid_onehot(synthetic_raw)
+        synthetic_df = prep.inverse_transform(synthetic_raw)
+
+        if target_col not in usable_cols:
+            synthetic_df[target_col] = df[target_col].sample(rows, replace=True).values
+
+        real_compare = df[usable_cols] if target_col in usable_cols else df[usable_cols + [target_col]]
+        synth_compare = synthetic_df[usable_cols] if target_col in usable_cols else synthetic_df[usable_cols + [target_col]]
+
+        fid_cols = [c for c in usable_cols if c != target_col]
+        fid = fidelity_score(real_compare[fid_cols], synth_compare[fid_cols])
+        util = utility_score(real_compare, synth_compare, target_col=target_col)
+        priv = privacy_score(real_compare[fid_cols], synth_compare[fid_cols])
+        score = synthguard_score(fid, util, priv)
+
+        dropped_columns = [c for c in df.columns if c not in usable_cols and c != target_col]
+
+        result = {
+            "fidelity": fid,
+            "utility": util,
+            "privacy": priv,
+            "synthguard_score": score,
+            "epsilon": achieved_epsilon,
+            "dropped_columns": dropped_columns,
+            "target_jointly_modeled": target_col in usable_cols,
+            "sample_rows": synthetic_df.head(5).to_dict(orient="records")
+        }
+
+        supabase.table("jobs").update({
+            "status": "completed",
+            "result": to_json_safe(result),
+            "synthetic_data": to_json_safe(synthetic_df.to_dict(orient="records"))
+        }).eq("id", job_id).execute()
+
+    except Exception as e:
+        supabase.table("jobs").update({"status": "failed", "error": str(e)}).eq("id", job_id).execute()
 
 
 @app.post("/generate")
