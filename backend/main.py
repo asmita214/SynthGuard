@@ -1,7 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
+import torch
+import gc
 import io
 
 from app.profiler import profile_dataset
@@ -9,6 +12,12 @@ from app.preprocessor import Preprocessor
 from app.train_vae import train_vae
 from app.validator import fidelity_score, utility_score, privacy_score, synthguard_score
 from app.db import supabase
+
+torch.set_num_threads(1)
+
+MAX_TRAIN_ROWS = 3000
+TRAIN_EPOCHS = 150
+STALE_JOB_MINUTES = 30
 
 app = FastAPI(title="SynthGuard API")
 
@@ -20,9 +29,20 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def fail_orphaned_jobs():
+    # Background jobs die when the server restarts, so anything still
+    # pending/running at startup can never finish.
+    try:
+        supabase.table("jobs").update({
+            "status": "failed",
+            "error": "The server restarted while this job was running (free-tier memory limit). Please start a new run."
+        }).in_("status", ["pending", "running"]).execute()
+    except Exception as e:
+        print("Could not clean orphaned jobs:", e)
+
+
 def to_json_safe(obj):
-    """Recursively converts numpy/pandas types into plain JSON-safe Python types,
-    replacing NaN/Infinity with None since strict JSON doesn't allow them."""
     if isinstance(obj, dict):
         return {k: to_json_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -58,6 +78,8 @@ async def upload_dataset(file: UploadFile = File(...), max_rows: int = Form(5000
     try:
         contents = await file.read()
         df = read_csv_safely(contents, max_rows)
+        del contents
+        gc.collect()
 
         profile = profile_dataset(df)
         data_records = to_json_safe(df.to_dict(orient="records"))
@@ -84,6 +106,9 @@ def run_generation_job(job_id: str, dataset_id: str, target_col: str, epsilon: f
         dataset_row = supabase.table("datasets").select("data").eq("id", dataset_id).single().execute()
         df = pd.DataFrame(dataset_row.data["data"])
 
+        if len(df) > MAX_TRAIN_ROWS:
+            df = df.sample(MAX_TRAIN_ROWS, random_state=42).reset_index(drop=True)
+
         profile = profile_dataset(df)
         prep = Preprocessor(profile)
         data = prep.fit_transform(df)
@@ -94,11 +119,15 @@ def run_generation_job(job_id: str, dataset_id: str, target_col: str, epsilon: f
 
         model, achieved_epsilon = train_vae(
             data, prep.numeric_dim, prep.categorical_slices,
-            latent_dim=8, epochs=300, use_dp=True, target_epsilon=epsilon, beta=0.5
+            latent_dim=8, epochs=TRAIN_EPOCHS, batch_size=128,
+            use_dp=True, target_epsilon=epsilon, beta=0.5
         )
 
         rows = n_rows or len(df)
         synthetic_raw = model._module.sample(rows, latent_dim=8).numpy()
+        del model
+        gc.collect()
+
         synthetic_raw = prep.to_valid_onehot(synthetic_raw)
         synthetic_df = prep.inverse_transform(synthetic_raw)
 
@@ -135,6 +164,8 @@ def run_generation_job(job_id: str, dataset_id: str, target_col: str, epsilon: f
 
     except Exception as e:
         supabase.table("jobs").update({"status": "failed", "error": str(e)}).eq("id", job_id).execute()
+    finally:
+        gc.collect()
 
 
 @app.post("/generate")
@@ -177,13 +208,25 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="job not found")
 
     job = job_row.data[0]
-    response = {"job_id": job_id, "status": job["status"]}
+    status = job["status"]
+    error = job.get("error")
 
-    if job["status"] == "completed":
+    if status in ("pending", "running") and job.get("created_at"):
+        created = datetime.fromisoformat(job["created_at"])
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_minutes = (datetime.now(timezone.utc) - created).total_seconds() / 60
+        if age_minutes > STALE_JOB_MINUTES:
+            status = "failed"
+            error = "This job timed out or the server restarted mid-run. Please start a new run."
+
+    response = {"job_id": job_id, "status": status}
+
+    if status == "completed":
         response["result"] = job["result"]
         response["result_id"] = job_id
-    elif job["status"] == "failed":
-        response["error"] = job["error"]
+    elif status == "failed":
+        response["error"] = error
 
     return response
 
