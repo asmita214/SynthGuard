@@ -39,10 +39,15 @@ def to_json_safe(obj):
     return obj
 
 
-def read_csv_safely(contents: bytes) -> pd.DataFrame:
+def read_csv_safely(contents: bytes, max_rows: int = 5000) -> pd.DataFrame:
     for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
         try:
-            return pd.read_csv(io.BytesIO(contents), encoding=enc)
+            samples = []
+            reader = pd.read_csv(io.BytesIO(contents), encoding=enc, chunksize=100_000)
+            for chunk in reader:
+                samples.append(chunk.sample(min(len(chunk), max_rows), random_state=42))
+            df = pd.concat(samples, ignore_index=True)
+            return df.sample(min(len(df), max_rows), random_state=42).reset_index(drop=True)
         except UnicodeDecodeError:
             continue
     raise ValueError("Could not decode the CSV. Please save it as UTF-8 and try again.")
@@ -52,10 +57,7 @@ def read_csv_safely(contents: bytes) -> pd.DataFrame:
 async def upload_dataset(file: UploadFile = File(...), max_rows: int = Form(5000)):
     try:
         contents = await file.read()
-        df = read_csv_safely(contents)
-
-        if len(df) > max_rows:
-            df = df.sample(max_rows, random_state=42).reset_index(drop=True)
+        df = read_csv_safely(contents, max_rows)
 
         profile = profile_dataset(df)
         data_records = to_json_safe(df.to_dict(orient="records"))
