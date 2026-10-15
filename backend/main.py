@@ -24,7 +24,7 @@ app = FastAPI(title="SynthGuard API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://synthguard-xxxx.vercel.app", "http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
