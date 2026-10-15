@@ -30,22 +30,53 @@ app.add_middleware(
 )
 
 
+# Supabase health check for UptimeRobot
+@app.api_route("/health", methods=["GET", "HEAD"])
+def health():
+    try:
+        supabase.table("datasets").select("id").limit(1).execute()
+        return {"status": "ok", "db": "ok"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"db error: {type(e).__name__}"
+        )
+
+
 def read_csv_safely(contents: bytes, max_rows: int = 5000) -> pd.DataFrame:
     for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
         try:
             samples = []
-            reader = pd.read_csv(io.BytesIO(contents), encoding=enc, chunksize=100_000)
+            reader = pd.read_csv(
+                io.BytesIO(contents),
+                encoding=enc,
+                chunksize=100_000
+            )
             for chunk in reader:
-                samples.append(chunk.sample(min(len(chunk), max_rows), random_state=42))
+                samples.append(
+                    chunk.sample(
+                        min(len(chunk), max_rows),
+                        random_state=42
+                    )
+                )
             df = pd.concat(samples, ignore_index=True)
-            return df.sample(min(len(df), max_rows), random_state=42).reset_index(drop=True)
+            return df.sample(
+                min(len(df), max_rows),
+                random_state=42
+            ).reset_index(drop=True)
         except UnicodeDecodeError:
             continue
-    raise ValueError("Could not decode the CSV. Please save it as UTF-8 and try again.")
+
+    raise ValueError(
+        "Could not decode the CSV. Please save it as UTF-8 and try again."
+    )
 
 
 @app.post("/upload")
-async def upload_dataset(file: UploadFile = File(...), max_rows: int = Form(5000)):
+async def upload_dataset(
+    file: UploadFile = File(...),
+    max_rows: int = Form(5000)
+):
     try:
         contents = await file.read()
         df = read_csv_safely(contents, max_rows)
@@ -64,14 +95,26 @@ async def upload_dataset(file: UploadFile = File(...), max_rows: int = Form(5000
         }).execute()
 
         dataset_id = result.data[0]["id"]
-        return {"dataset_id": dataset_id, "profile": profile_safe, "row_count": len(df)}
+
+        return {
+            "dataset_id": dataset_id,
+            "profile": profile_safe,
+            "row_count": len(df)
+        }
 
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Upload failed: {type(e).__name__}: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload failed: {type(e).__name__}: {str(e)}"
+        )
 
 
 def dispatch_job(job_id: str, n_rows):
-    url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{GH_WORKFLOW}/dispatches"
+    url = (
+        f"https://api.github.com/repos/{GH_REPO}"
+        f"/actions/workflows/{GH_WORKFLOW}/dispatches"
+    )
+
     resp = httpx.post(
         url,
         headers={
@@ -79,11 +122,21 @@ def dispatch_job(job_id: str, n_rows):
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         },
-        json={"ref": GH_REF, "inputs": {"job_id": job_id, "n_rows": str(n_rows or "")}},
+        json={
+            "ref": GH_REF,
+            "inputs": {
+                "job_id": job_id,
+                "n_rows": str(n_rows or "")
+            }
+        },
         timeout=20,
     )
+
     if resp.status_code != 204:
-        raise RuntimeError(f"GitHub dispatch failed ({resp.status_code}): {resp.text[:200]}")
+        raise RuntimeError(
+            f"GitHub dispatch failed ({resp.status_code}): "
+            f"{resp.text[:200]}"
+        )
 
 
 @app.post("/generate")
@@ -94,15 +147,30 @@ async def generate_synthetic(
     epsilon: float = Form(5.0),
     n_rows: int = Form(None)
 ):
-    dataset_row = supabase.table("datasets").select("data").eq("id", dataset_id).execute()
-    if not dataset_row.data:
-        raise HTTPException(status_code=404, detail="dataset not found")
+    dataset_row = (
+        supabase.table("datasets")
+        .select("data")
+        .eq("id", dataset_id)
+        .execute()
+    )
 
-    df_columns = list(dataset_row.data[0]["data"][0].keys())
+    if not dataset_row.data:
+        raise HTTPException(
+            status_code=404,
+            detail="dataset not found"
+        )
+
+    df_columns = list(
+        dataset_row.data[0]["data"][0].keys()
+    )
+
     if target_col not in df_columns:
         raise HTTPException(
             status_code=400,
-            detail=f"target_col '{target_col}' not found. Available columns: {df_columns}"
+            detail=(
+                f"target_col '{target_col}' not found. "
+                f"Available columns: {df_columns}"
+            )
         )
 
     job_insert = supabase.table("jobs").insert({
@@ -118,21 +186,45 @@ async def generate_synthetic(
         try:
             dispatch_job(job_id, n_rows)
         except Exception as e:
-            supabase.table("jobs").update({"status": "failed", "error": str(e)}).eq("id", job_id).execute()
-            raise HTTPException(status_code=502, detail=str(e))
+            (
+                supabase.table("jobs")
+                .update({
+                    "status": "failed",
+                    "error": str(e)
+                })
+                .eq("id", job_id)
+                .execute()
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail=str(e)
+            )
     else:
         # Local dev only (needs torch installed): run in-process.
         from app.runner import run_job
         background_tasks.add_task(run_job, job_id, n_rows)
 
-    return {"job_id": job_id, "status": "pending"}
+    return {
+        "job_id": job_id,
+        "status": "pending"
+    }
 
 
 @app.get("/jobs/{job_id}")
 async def get_job_status(job_id: str):
-    job_row = supabase.table("jobs").select("*").eq("id", job_id).execute()
+    job_row = (
+        supabase.table("jobs")
+        .select("*")
+        .eq("id", job_id)
+        .execute()
+    )
+
     if not job_row.data:
-        raise HTTPException(status_code=404, detail="job not found")
+        raise HTTPException(
+            status_code=404,
+            detail="job not found"
+        )
 
     job = job_row.data[0]
     status = job["status"]
@@ -140,18 +232,30 @@ async def get_job_status(job_id: str):
 
     if status in ("pending", "running") and job.get("created_at"):
         created = datetime.fromisoformat(job["created_at"])
+
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        age_minutes = (datetime.now(timezone.utc) - created).total_seconds() / 60
+
+        age_minutes = (
+            datetime.now(timezone.utc) - created
+        ).total_seconds() / 60
+
         if age_minutes > STALE_JOB_MINUTES:
             status = "failed"
-            error = "This job timed out or the server restarted mid-run. Please start a new run."
+            error = (
+                "This job timed out or the server restarted mid-run. "
+                "Please start a new run."
+            )
 
-    response = {"job_id": job_id, "status": status}
+    response = {
+        "job_id": job_id,
+        "status": status
+    }
 
     if status == "completed":
         response["result"] = job["result"]
         response["result_id"] = job_id
+
     elif status == "failed":
         response["error"] = error
 
@@ -160,7 +264,20 @@ async def get_job_status(job_id: str):
 
 @app.get("/download/{job_id}")
 async def download_synthetic(job_id: str):
-    job_row = supabase.table("jobs").select("status, synthetic_data").eq("id", job_id).execute()
-    if not job_row.data or job_row.data[0]["status"] != "completed":
-        raise HTTPException(status_code=404, detail="result not found or job not completed")
+    job_row = (
+        supabase.table("jobs")
+        .select("status, synthetic_data")
+        .eq("id", job_id)
+        .execute()
+    )
+
+    if (
+        not job_row.data
+        or job_row.data[0]["status"] != "completed"
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail="result not found or job not completed"
+        )
+
     return job_row.data[0]["synthetic_data"]
