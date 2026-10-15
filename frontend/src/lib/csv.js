@@ -118,7 +118,7 @@ export function validateCsvFile(file) {
  * @param {{onProgress?: (pct: number) => void, worker?: boolean}} [opts]
  * @returns {Promise<ParsedCsv>}
  */
-export function parseCsvFile(file, { onProgress, worker = true } = {}) {
+export function parseCsvFile(file, { onProgress, worker = false } = {}) {
   return new Promise((resolve, reject) => {
     if (!file) {
       reject(new CsvError('No file supplied.', { code: 'no-file' }));
