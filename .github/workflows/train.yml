@@ -1,0 +1,40 @@
+name: train-job
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Supabase jobs.id"
+        required: true
+      n_rows:
+        description: "Rows to generate (optional)"
+        required: false
+        default: ""
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-worker.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-worker.txt
+
+      - name: Train and score
+        working-directory: backend
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          N_ROWS: ${{ github.event.inputs.n_rows }}
+        run: python worker.py

@@ -1,22 +1,23 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone
+import os
 import pandas as pd
-import numpy as np
-import torch
+import httpx
 import gc
 import io
 
 from app.profiler import profile_dataset
-from app.preprocessor import Preprocessor
-from app.train_vae import train_vae
-from app.validator import fidelity_score, utility_score, privacy_score, synthguard_score
 from app.db import supabase
+from app.jsonutil import to_json_safe
 
-torch.set_num_threads(1)
+# Heavy training (torch/opacus) does NOT run here. This API only enqueues jobs;
+# a GitHub Actions worker trains and writes results to Supabase.
+GH_TOKEN = os.getenv("GH_TOKEN")
+GH_REPO = os.getenv("GH_REPO", "asmita214/SynthGuard")
+GH_REF = os.getenv("GH_REF", "main")
+GH_WORKFLOW = os.getenv("GH_WORKFLOW", "train.yml")
 
-MAX_TRAIN_ROWS = 3000
-TRAIN_EPOCHS = 150
 STALE_JOB_MINUTES = 30
 
 app = FastAPI(title="SynthGuard API")
@@ -27,36 +28,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def fail_orphaned_jobs():
-    # Background jobs die when the server restarts, so anything still
-    # pending/running at startup can never finish.
-    try:
-        supabase.table("jobs").update({
-            "status": "failed",
-            "error": "The server restarted while this job was running (free-tier memory limit). Please start a new run."
-        }).in_("status", ["pending", "running"]).execute()
-    except Exception as e:
-        print("Could not clean orphaned jobs:", e)
-
-
-def to_json_safe(obj):
-    if isinstance(obj, dict):
-        return {k: to_json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [to_json_safe(v) for v in obj]
-    if isinstance(obj, (np.floating, float)):
-        val = float(obj)
-        if np.isnan(val) or np.isinf(val):
-            return None
-        return val
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    return obj
 
 
 def read_csv_safely(contents: bytes, max_rows: int = 5000) -> pd.DataFrame:
@@ -99,73 +70,20 @@ async def upload_dataset(file: UploadFile = File(...), max_rows: int = Form(5000
         raise HTTPException(status_code=400, detail=f"Upload failed: {type(e).__name__}: {str(e)}")
 
 
-def run_generation_job(job_id: str, dataset_id: str, target_col: str, epsilon: float, n_rows: int):
-    supabase.table("jobs").update({"status": "running"}).eq("id", job_id).execute()
-
-    try:
-        dataset_row = supabase.table("datasets").select("data").eq("id", dataset_id).single().execute()
-        df = pd.DataFrame(dataset_row.data["data"])
-
-        if len(df) > MAX_TRAIN_ROWS:
-            df = df.sample(MAX_TRAIN_ROWS, random_state=42).reset_index(drop=True)
-
-        profile = profile_dataset(df)
-        prep = Preprocessor(profile)
-        data = prep.fit_transform(df)
-
-        usable_cols = prep.numeric_cols + prep.categorical_cols
-        if not usable_cols:
-            raise ValueError("No usable numeric/categorical columns found to synthesize.")
-
-        model, achieved_epsilon = train_vae(
-            data, prep.numeric_dim, prep.categorical_slices,
-            latent_dim=8, epochs=TRAIN_EPOCHS, batch_size=128,
-            use_dp=True, target_epsilon=epsilon, beta=0.5
-        )
-
-        rows = n_rows or len(df)
-        synthetic_raw = model._module.sample(rows, latent_dim=8).numpy()
-        del model
-        gc.collect()
-
-        synthetic_raw = prep.to_valid_onehot(synthetic_raw)
-        synthetic_df = prep.inverse_transform(synthetic_raw)
-
-        if target_col not in usable_cols:
-            synthetic_df[target_col] = df[target_col].sample(rows, replace=True).values
-
-        real_compare = df[usable_cols] if target_col in usable_cols else df[usable_cols + [target_col]]
-        synth_compare = synthetic_df[usable_cols] if target_col in usable_cols else synthetic_df[usable_cols + [target_col]]
-
-        fid_cols = [c for c in usable_cols if c != target_col]
-        fid = fidelity_score(real_compare[fid_cols], synth_compare[fid_cols])
-        util = utility_score(real_compare, synth_compare, target_col=target_col)
-        priv = privacy_score(real_compare[fid_cols], synth_compare[fid_cols])
-        score = synthguard_score(fid, util, priv)
-
-        dropped_columns = [c for c in df.columns if c not in usable_cols and c != target_col]
-
-        result = {
-            "fidelity": fid,
-            "utility": util,
-            "privacy": priv,
-            "synthguard_score": score,
-            "epsilon": achieved_epsilon,
-            "dropped_columns": dropped_columns,
-            "target_jointly_modeled": target_col in usable_cols,
-            "sample_rows": synthetic_df.head(5).to_dict(orient="records")
-        }
-
-        supabase.table("jobs").update({
-            "status": "completed",
-            "result": to_json_safe(result),
-            "synthetic_data": to_json_safe(synthetic_df.to_dict(orient="records"))
-        }).eq("id", job_id).execute()
-
-    except Exception as e:
-        supabase.table("jobs").update({"status": "failed", "error": str(e)}).eq("id", job_id).execute()
-    finally:
-        gc.collect()
+def dispatch_job(job_id: str, n_rows):
+    url = f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{GH_WORKFLOW}/dispatches"
+    resp = httpx.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {GH_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        json={"ref": GH_REF, "inputs": {"job_id": job_id, "n_rows": str(n_rows or "")}},
+        timeout=20,
+    )
+    if resp.status_code != 204:
+        raise RuntimeError(f"GitHub dispatch failed ({resp.status_code}): {resp.text[:200]}")
 
 
 @app.post("/generate")
@@ -196,7 +114,16 @@ async def generate_synthetic(
 
     job_id = job_insert.data[0]["id"]
 
-    background_tasks.add_task(run_generation_job, job_id, dataset_id, target_col, epsilon, n_rows)
+    if GH_TOKEN:
+        try:
+            dispatch_job(job_id, n_rows)
+        except Exception as e:
+            supabase.table("jobs").update({"status": "failed", "error": str(e)}).eq("id", job_id).execute()
+            raise HTTPException(status_code=502, detail=str(e))
+    else:
+        # Local dev only (needs torch installed): run in-process.
+        from app.runner import run_job
+        background_tasks.add_task(run_job, job_id, n_rows)
 
     return {"job_id": job_id, "status": "pending"}
 
